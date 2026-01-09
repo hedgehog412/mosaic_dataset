@@ -80,7 +80,7 @@ class MosaicDataset(Dataset):
             dx = rng.uniform(-self.jitter_px, self.jitter_px)
             dy = rng.uniform(-self.jitter_px, self.jitter_px)
             aug_tile = Tile(t.tile_id, t.cx + dx, t.cy + dy, t.color)
-            tile_mask = self.render_tile_mask(aug_tile, tile_size, rng, aug_img=aug_img)
+            tile_mask = self.render_tile_mask(aug_tile, tile_size, rng)
             x_start = int(round(aug_tile.cx - tile_size / 2))
             y_start = int(round(aug_tile.cy - tile_size / 2))
             x_end = x_start + tile_size
@@ -209,4 +209,15 @@ class MosaicDataset(Dataset):
 
             event = Event(etype, session_id, timestamp, tile, init_x, init_y, active_tiles)
             session.events.append(event)
+            session.num_steps += 1
         return session
+
+
+# For testing on local
+if __name__ == "__main__":
+    dataset = MosaicDataset("../mosaic_GUI/session_logs", include_intermediate=True, copy_num=3)
+    print(f"Total dataset length: {len(dataset)}")
+    dataset.set_epoch(0)
+    for i in range(len(dataset)):
+        img = dataset[i]
+        print(f"Image {i} shape: {img.shape}")
