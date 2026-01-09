@@ -8,11 +8,11 @@ import numpy as np
 class MosaicDataset(Dataset):
     def __init__(self, log_dir: str|Path, \
                 include_intermediate=True, copy_num=5, \
-                global_seed=12, aug_img_p=0.5, \
-                jitter_px=2.0, dropout_p=0.02,\
-                rot_deg_max=4.0, scale_p=0.05,\
-                chip_p=0.10, chip_max_frac=0.20,\
-                edge_dropout_p=0.01):
+                global_seed=12, aug_img_p=0.8, \
+                jitter_px=3.0, dropout_p=0.02,\
+                rot_deg_max=10.0, scale_p=0.05,\
+                chip_p=0.10, chip_max_frac=0.30,\
+                edge_dropout_p=0.02, enable_augmentation=True):
         self.log_dir = Path(log_dir)
         self.sessions = [self.load_session(path) for path in self.log_dir.glob("*.jsonl")]
         self.total_sessions = len(self.sessions)
@@ -23,6 +23,7 @@ class MosaicDataset(Dataset):
         self.include_intermediate = include_intermediate
         self.copy_num = copy_num
 
+        self.enable_augmentation = enable_augmentation
         self.aug_img_p = aug_img_p
         self.jitter_px = jitter_px
         self.dropout_p = dropout_p
@@ -69,7 +70,7 @@ class MosaicDataset(Dataset):
         seed = (self.global_seed + 100000 * self.epoch + 1000 * si + 10 * ei + aug_i) % (2 ** 32 - 1)
         rng = np.random.default_rng(seed = seed)
         aug_img = False
-        if aug_i <= self.copy_num * self.aug_img_p:
+        if self.enable_augmentation and aug_i < self.copy_num * self.aug_img_p:
             aug_img = True
         img = self.render_tiles(session.events[ei].canvas_state, session.canvas_width, session.canvas_height, session.tile_size, rng, aug_img=aug_img)
         return img
@@ -77,10 +78,14 @@ class MosaicDataset(Dataset):
     def render_tiles(self, tiles: list[Tile], canvas_w: int, canvas_h: int, tile_size: int, rng: np.random.Generator, out_size=(128, 128), aug_img=False) -> torch.Tensor:
         img = np.ones((canvas_h, canvas_w, 1), dtype=np.float32)
         for t in tiles:
-            dx = rng.uniform(-self.jitter_px, self.jitter_px)
-            dy = rng.uniform(-self.jitter_px, self.jitter_px)
+            if aug_img:
+                dx = rng.uniform(-self.jitter_px, self.jitter_px)
+                dy = rng.uniform(-self.jitter_px, self.jitter_px)
+            else:
+                dx = 0.0
+                dy = 0.0
             aug_tile = Tile(t.tile_id, t.cx + dx, t.cy + dy, t.color)
-            tile_mask = self.render_tile_mask(aug_tile, tile_size, rng)
+            tile_mask = self.render_tile_mask(aug_tile, tile_size, rng, aug_img=aug_img)
             x_start = int(round(aug_tile.cx - tile_size / 2))
             y_start = int(round(aug_tile.cy - tile_size / 2))
             x_end = x_start + tile_size
@@ -90,15 +95,15 @@ class MosaicDataset(Dataset):
             img[y_start:y_end, x_start:x_end, :] *= tile_mask
         return torch.from_numpy(img)
 
-    def render_tile_mask(self, tile: Tile, tile_size: int, rng: np.random.Generator) -> np.ndarray:
-        if self.dropout_p > 0.0 and rng.uniform(0.0, 1.0) < self.dropout_p:
-            return np.zeros((tile_size, tile_size, 1), dtype=np.float32)
+    def render_tile_mask(self, tile: Tile, tile_size: int, rng: np.random.Generator, aug_img=False) -> np.ndarray:
+        if aug_img and self.dropout_p > 0.0 and rng.uniform(0.0, 1.0) < self.dropout_p:
+            return np.ones((tile_size, tile_size, 1), dtype=np.float32)
 
-        base = np.ones((tile_size, tile_size, 1), dtype=np.float32)
+        base = np.zeros((tile_size, tile_size, 1), dtype=np.float32)
         # Create coordinate grids
         y_coords, x_coords = np.ogrid[:tile_size, :tile_size]
 
-        if self.chip_p > 0.0 and rng.uniform(0.0, 1.0) < self.chip_p:
+        if aug_img and self.chip_p > 0.0 and rng.uniform(0.0, 1.0) < self.chip_p:
             frac = rng.uniform(0.0, self.chip_max_frac)
             chip_w = int(tile_size * frac)
             chip_h = int(tile_size * frac)
@@ -113,9 +118,9 @@ class MosaicDataset(Dataset):
             else:  # Bottom-right triangle
                 mask = (x_coords >= tile_size - chip_w) & (y_coords >= tile_size - chip_h) & ((tile_size - x_coords) + (tile_size - y_coords) <= chip_w)
             
-            base[mask, :] = 0
+            base[mask, :] = 1
 
-        if self.edge_dropout_p > 0.0:
+        if aug_img and self.edge_dropout_p > 0.0:
             edge_mask = np.zeros((tile_size, tile_size), dtype=bool)
             edge_width = int(tile_size * 0.1)
             edge_mask[:edge_width, :] = True  # Top edge
@@ -124,26 +129,46 @@ class MosaicDataset(Dataset):
             edge_mask[:, -edge_width:] = True  # Right edge
 
             dropout_mask = (rng.uniform(0.0, 1.0, size=(tile_size, tile_size)) < self.edge_dropout_p) & edge_mask
-            base[dropout_mask, :] = 0
+            base[dropout_mask, :] = 1
 
-        if self.rot_deg_max > 0.0 or (self.scale_p > 0.0 and self.scale_p < 1.0):
+        if aug_img and (self.rot_deg_max > 0.0 or self.scale_p > 0.0):
             cx = tile_size / 2
             cy = tile_size / 2
 
-            scale = 1.0 + rng.uniform(-self.scale_p, self.scale_p)
-            sx = (x_coords - cx) * scale
-            sy = (y_coords - cy) * scale
+            # Apply inverse transformation: for each output pixel, find source in input
+            # Center the coordinates
+            x_centered = x_coords - cx
+            y_centered = y_coords - cy
 
-            angle = np.deg2rad(rng.uniform(-self.rot_deg_max, self.rot_deg_max))
-            cos_a = np.cos(angle)
-            sin_a = np.sin(angle)
-            rx = cos_a * sx + sin_a * sy + cx
-            ry = -sin_a * sx + cos_a * sy + cy
+            # Apply inverse rotation (rotate by -angle)
+            if self.rot_deg_max > 0.0:
+                angle = np.deg2rad(rng.uniform(-self.rot_deg_max, self.rot_deg_max))
+            else:
+                angle = 0.0
+            
+            cos_a = np.cos(-angle)
+            sin_a = np.sin(-angle)
+            x_rotated = cos_a * x_centered - sin_a * y_centered
+            y_rotated = sin_a * x_centered + cos_a * y_centered
 
-            xi = np.clip(np.round(rx).astype(int), 0, tile_size - 1)
-            yi = np.clip(np.round(ry).astype(int), 0, tile_size - 1)
+            # Apply inverse scaling (divide by scale)
+            if self.scale_p > 0.0:
+                scale = 1.0 + rng.uniform(-self.scale_p, self.scale_p)
+            else:
+                scale = 1.0
+            
+            x_src = x_rotated / scale + cx
+            y_src = y_rotated / scale + cy
+
+            # Sample from original base using source coordinates
+            xi = np.round(x_src).astype(int)
+            yi = np.round(y_src).astype(int)
+            
+            # Create output array (default to 1s, meaning no tile)
+            result = np.ones((tile_size, tile_size, 1), dtype=np.float32)
             mask = (xi >= 0) & (xi < tile_size) & (yi >= 0) & (yi < tile_size)
-            base[mask, :] = base[yi[mask], xi[mask], :]
+            result[mask] = base[yi[mask], xi[mask]]
+            return result
         return base
 
     def load_session(self, path: str|Path) -> Session:
@@ -215,9 +240,13 @@ class MosaicDataset(Dataset):
 
 # For testing on local
 if __name__ == "__main__":
-    dataset = MosaicDataset("../mosaic_GUI/session_logs", include_intermediate=True, copy_num=3)
+    dataset = MosaicDataset("../mosaic_GUI/session_logs", include_intermediate=False, copy_num=5, enable_augmentation=True)
     print(f"Total dataset length: {len(dataset)}")
-    dataset.set_epoch(0)
+    dataset.set_epoch(3)
     for i in range(len(dataset)):
         img = dataset[i]
         print(f"Image {i} shape: {img.shape}")
+        import matplotlib.pyplot as plt
+        plt.imshow(img.detach().cpu(), cmap="gray")
+        plt.axis("off")
+        plt.show()
