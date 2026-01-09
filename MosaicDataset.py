@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import Dataset
 import json
 from pathlib import Path
-from mosaic_dataset.DataClasses import Tile, Event, Session
+from DataClasses import Tile, Event, Session
 import numpy as np
 
 class MosaicDataset(Dataset):
@@ -161,7 +161,9 @@ class MosaicDataset(Dataset):
         tile_size = int(metadata.get("tile_size"))
         available_colors = list(metadata.get("available_colors", []))
 
-        session = Session(goal, session_id, start_time, canvas_width, canvas_height, tile_size, available_colors, [], [])
+        session = Session(num_steps=0, goal=goal, session_id=session_id, \
+                        start_time=start_time, canvas_width=canvas_width, canvas_height=canvas_height, \
+                        tile_size=tile_size, available_colors=available_colors, events=[])
 
         active_tiles = []
         for line in lines[1:]:
@@ -184,7 +186,7 @@ class MosaicDataset(Dataset):
 
             
             if session_id != session.session_id:
-                raise ValueError(f"Invalid session id at file: {path}")
+                raise ValueError(f"Invalid session id at file: {path}\n Expected: {session.session_id}, Found: {session_id}")
 
             if etype == Event.ADD:
                 active_tiles.append(tile)
