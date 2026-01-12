@@ -73,6 +73,7 @@ class MosaicDataset(Dataset):
         if self.enable_augmentation and aug_i < self.copy_num * self.aug_img_p:
             aug_img = True
         img = self.render_tiles(session.events[ei].canvas_state, session.canvas_width, session.canvas_height, session.tile_size, rng, aug_img=aug_img)
+        img = img.permute(2, 0, 1)  # HWC to CHW
         return img
 
     def render_tiles(self, tiles: list[Tile], canvas_w: int, canvas_h: int, tile_size: int, rng: np.random.Generator, out_size=(128, 128), aug_img=False) -> torch.Tensor:
