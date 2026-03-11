@@ -12,7 +12,9 @@ class MosaicDataset(Dataset):
                 jitter_px=3.0, dropout_p=0.02,\
                 rot_deg_max=10.0, scale_p=0.05,\
                 chip_p=0.10, chip_max_frac=0.30,\
-                edge_dropout_p=0.02, enable_augmentation=True):
+                edge_dropout_p=0.02, enable_augmentation=True,\
+                crop_padding_frac=0.3, crop_jitter_frac=0.1,\
+                output_size=(256, 256), min_tiles=1):
         self.log_dir = Path(log_dir)
         self.sessions = [self.load_session(path) for path in self.log_dir.glob("*.jsonl")]
         self.total_sessions = len(self.sessions)
@@ -32,13 +34,26 @@ class MosaicDataset(Dataset):
         self.chip_p = chip_p
         self.chip_max_frac = chip_max_frac
         self.edge_dropout_p = edge_dropout_p
+        
+        # Camera-like cropping parameters
+        self.crop_padding_frac = crop_padding_frac  # Padding around tiles as fraction of scene size
+        self.crop_jitter_frac = crop_jitter_frac  # Random crop offset as fraction of padding (for augmentation)
+        self.output_size = output_size
+        self.min_tiles = min_tiles  # Minimum number of tiles required for valid sample
 
         # Converting dataset idx to session, step idx if intermediate steps included
+        # Filter out events with fewer than min_tiles
         self.base_idx = []
         if self.include_intermediate:
             for si, s in enumerate(self.sessions):
                 for ei in range(s.num_steps):
-                    self.base_idx.append((si, ei))
+                    if len(s.events[ei].canvas_state) >= self.min_tiles:
+                        self.base_idx.append((si, ei))
+        else:
+            # For final states only, filter sessions with insufficient tiles
+            for si, s in enumerate(self.sessions):
+                if s.num_steps > 0 and len(s.events[s.num_steps - 1].canvas_state) >= self.min_tiles:
+                    self.base_idx.append((si, s.num_steps - 1))
 
         self.global_seed = global_seed
         self.epoch = 0
@@ -48,22 +63,19 @@ class MosaicDataset(Dataset):
         self.epoch = epoch
 
     def __len__(self):
-        if self.include_intermediate:
-            return self.total_steps * self.copy_num
-        else:
-            return self.total_sessions * self.copy_num
+        return len(self.base_idx) * self.copy_num
 
     def __getitem__(self, idx):
         # For getting session/event
         base_i = idx // self.copy_num
-
-        if self.include_intermediate:
-            (si, ei) = self.base_idx[base_i]
-        else:
-            (si, ei) = base_i, self.sessions[base_i].num_steps - 1
+        (si, ei) = self.base_idx[base_i]
         
         session = self.sessions[si]
         event = session.events[ei]
+        
+        # Sanity check: should never happen after filtering, but just in case
+        if len(event.canvas_state) < self.min_tiles:
+            raise ValueError(f"Invalid sample at idx {idx}: only {len(event.canvas_state)} tiles, minimum is {self.min_tiles}")
 
         # For getting augmentation copy
         aug_i = idx % self.copy_num
@@ -75,8 +87,52 @@ class MosaicDataset(Dataset):
         img = self.render_tiles(session.events[ei].canvas_state, session.canvas_width, session.canvas_height, session.tile_size, rng, aug_img=aug_img)
         img = img.permute(2, 0, 1)  # HWC to CHW
         return img
+    
+    def calculate_bounding_box(self, tiles: list[Tile], tile_size: int, canvas_w: int, canvas_h: int, padding_frac: float):
+        """Calculate bounding box around all tiles with padding."""
+        if len(tiles) == 0:
+            # No tiles, return center crop
+            half_w = canvas_w // 4
+            half_h = canvas_h // 4
+            cx, cy = canvas_w // 2, canvas_h // 2
+            return max(0, cx - half_w), max(0, cy - half_h), min(canvas_w, cx + half_w), min(canvas_h, cy + half_h)
+        
+        # Find min/max coordinates of all tiles
+        min_x = min(t.cx - tile_size / 2 for t in tiles)
+        max_x = max(t.cx + tile_size / 2 for t in tiles)
+        min_y = min(t.cy - tile_size / 2 for t in tiles)
+        max_y = max(t.cy + tile_size / 2 for t in tiles)
+        
+        # Calculate scene size and add padding
+        scene_w = max_x - min_x
+        scene_h = max_y - min_y
+        padding_w = scene_w * padding_frac
+        padding_h = scene_h * padding_frac
+        
+        # Apply padding
+        x1 = max(0, int(min_x - padding_w))
+        y1 = max(0, int(min_y - padding_h))
+        x2 = min(canvas_w, int(max_x + padding_w))
+        y2 = min(canvas_h, int(max_y + padding_h))
+        
+        return x1, y1, x2, y2
 
     def render_tiles(self, tiles: list[Tile], canvas_w: int, canvas_h: int, tile_size: int, rng: np.random.Generator, out_size=(128, 128), aug_img=False) -> torch.Tensor:
+        # Calculate initial bounding box
+        x1, y1, x2, y2 = self.calculate_bounding_box(tiles, tile_size, canvas_w, canvas_h, self.crop_padding_frac)
+        
+        # Apply random crop jitter for augmentation (simulates camera movement)
+        if aug_img and self.crop_jitter_frac > 0:
+            crop_w = x2 - x1
+            crop_h = y2 - y1
+            jitter_x = rng.uniform(-crop_w * self.crop_jitter_frac, crop_w * self.crop_jitter_frac)
+            jitter_y = rng.uniform(-crop_h * self.crop_jitter_frac, crop_h * self.crop_jitter_frac)
+            x1 = int(max(0, x1 + jitter_x))
+            y1 = int(max(0, y1 + jitter_y))
+            x2 = int(min(canvas_w, x2 + jitter_x))
+            y2 = int(min(canvas_h, y2 + jitter_y))
+        
+        # Render full canvas
         img = np.ones((canvas_h, canvas_w, 1), dtype=np.float32)
         for t in tiles:
             if aug_img:
@@ -94,7 +150,31 @@ class MosaicDataset(Dataset):
             if x_start < 0 or y_start < 0 or x_end > canvas_w or y_end > canvas_h:
                 continue
             img[y_start:y_end, x_start:x_end, :] *= tile_mask
-        return torch.from_numpy(img)
+        
+        # Crop to region of interest (camera-like cropping)
+        cropped_img = img[y1:y2, x1:x2, :]
+        
+        # Place cropped image in center of fixed-size canvas (no scaling to preserve tile size)
+        crop_h, crop_w = cropped_img.shape[:2]
+        output_h, output_w = self.output_size[1], self.output_size[0]
+        
+        # Create canvas with padding (white background)
+        canvas = np.ones((output_h, output_w, 1), dtype=np.float32)
+        
+        if crop_h > 0 and crop_w > 0:
+            # If crop is larger than output, center-crop it
+            if crop_h > output_h or crop_w > output_w:
+                start_y = max(0, (crop_h - output_h) // 2)
+                start_x = max(0, (crop_w - output_w) // 2)
+                cropped_img = cropped_img[start_y:start_y + output_h, start_x:start_x + output_w, :]
+                crop_h, crop_w = cropped_img.shape[:2]
+            
+            # Center the cropped image on the canvas
+            start_y = (output_h - crop_h) // 2
+            start_x = (output_w - crop_w) // 2
+            canvas[start_y:start_y + crop_h, start_x:start_x + crop_w, :] = cropped_img
+        
+        return torch.from_numpy(canvas)
 
     def render_tile_mask(self, tile: Tile, tile_size: int, rng: np.random.Generator, aug_img=False) -> np.ndarray:
         if aug_img and self.dropout_p > 0.0 and rng.uniform(0.0, 1.0) < self.dropout_p:
