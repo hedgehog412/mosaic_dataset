@@ -57,10 +57,24 @@ class MosaicDataset(Dataset):
 
         self.global_seed = global_seed
         self.epoch = 0
+        
+        # For using a provided seed instead of generating one
+        self.use_provided_seed = False
+        self.provided_seed = None
 
     # NEEDS TO BE CALLED FOR EACH EPOCH FOR EPOCH DEPENDENT RANDOMNESS
     def set_epoch(self, epoch: int):
         self.epoch = epoch
+    
+    def set_fixed_seed(self, seed: int):
+        """Use a fixed seed for all subsequent __getitem__ calls."""
+        self.use_provided_seed = True
+        self.provided_seed = seed
+    
+    def clear_fixed_seed(self):
+        """Resume generating seeds based on epoch/session/step."""
+        self.use_provided_seed = False
+        self.provided_seed = None
 
     def __len__(self):
         return len(self.base_idx) * self.copy_num
@@ -79,7 +93,13 @@ class MosaicDataset(Dataset):
 
         # For getting augmentation copy
         aug_i = idx % self.copy_num
-        seed = (self.global_seed + 100000 * self.epoch + 1000 * si + 10 * ei + aug_i) % (2 ** 32 - 1)
+        
+        # Use provided seed if set, otherwise generate one
+        if self.use_provided_seed:
+            seed = self.provided_seed
+        else:
+            seed = (self.global_seed + 100000 * self.epoch + 1000 * si + 10 * ei + aug_i) % (2 ** 32 - 1)
+        
         rng = np.random.default_rng(seed = seed)
         aug_img = False
         if self.enable_augmentation and aug_i < self.copy_num * self.aug_img_p:
